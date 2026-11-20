@@ -347,7 +347,7 @@ dialog::backdrop{background:rgba(6,9,16,.66);backdrop-filter:blur(4px)}
         </select>
       </label>
     </details>
-    <input type="hidden" id="tAcc" value="90"><input type="hidden" id="tRej" value="80">
+    <input type="hidden" id="tmTol" value="20"><input type="hidden" id="tAcc" value="90"><input type="hidden" id="tRej" value="80">
     <select id="tol" hidden><option value="1" selected>Strict (1 px)</option><option value="2">Normal (2 px)</option><option value="3">Loose (3 px)</option></select>
   </section>
 
@@ -401,7 +401,10 @@ dialog::backdrop{background:rgba(6,9,16,.66);backdrop-filter:blur(4px)}
       <label class="field">Edge tolerance
         <select id="oTol"><option value="1">Strict: 1 px (about 0.1 mm on a 100 mm logo)</option><option value="2">Normal: 2 px</option><option value="3">Loose: 3 px</option></select>
       </label>
-      <p class="muted">Scores between the two levels are graded "Accept with concern".</p>
+      <label class="field">Small mark (™ / ®) size — controlled centrally
+        <input type="hidden" id="oTmTol" value="0"><span class="tag" style="align-self:flex-start">Measure only on this device</span>
+      </label>
+      <p class="muted">Scores between the two levels are graded "Accept with concern". Mark size: within tolerance = OK, up to 2× tolerance = Accept with concern, more = Reject.</p>
     </div>
     <div class="grp">
       <h4>This device</h4>
@@ -719,13 +722,29 @@ function analyse(rot,opt){rot=rot||0;opt=opt||{};
     const t=markCheck(Pw,padView,W,H,R,g,inkKind);return {name:g.name,presence:true,present:t.score>=50,score:t.score,dbg:t};});
   // overall = 90% logo body + 10% small marks (™), so a missing ™ is visible in the score
   // in the maps, small marks are shown by their presence result (their outline is below photo resolution)
-  M.regions.forEach((g,k)=>{if(!g.presence)return;const ok=regions[k].score>=50;
+  M.regions.forEach((g,k)=>{if(!g.presence)return;const ok=regions[k].score>=50&&judgeMarkSize(regions[k]).status!=="fail";
     for(let y=Math.round(g.y0*H);y<Math.round(g.y1*H);y++)for(let x=Math.round(g.x0*W);x<Math.round(g.x1*W);x++){const i=y*W+x;extra[i]=0;missing[i]=(!ok&&R[i])?1:0;Cs[i]=ok?R[i]:0;}});
   const marks=regions.filter(r=>r.presence);const overall=Object.assign({},body);
-  if(marks.length){const ms=marks.reduce((a,r)=>a+r.score,0)/marks.length;overall.score=body.score*0.9+ms*0.1;}
+  marks.forEach(r=>{r.size=judgeMarkSize(r);});
+  if(marks.length){const ms=marks.reduce((a,r)=>a+r.score*(r.size&&r.size.match!=null?r.size.match/100:1),0)/marks.length;overall.score=body.score*0.9+ms*0.1;}
   overall.specks=specks;overall.local=local;
   return {overall,regions,W,H,R,Cs,missing,extra,Pw,padView,fit:best,rot,inkKind,sharp:sharpness(Pw,W,H,R,inkKind),dbg:{crop,m,box:bb,corr:found.corr,map}};
 }
+// ™ size must be the same as the master: allowed difference set in Owner settings (0 = size not checked)
+/* ---------- central config (TM size rule) ---------- */
+const CFG_DEFAULT={tmMode:"flag",tmMax:2.5,tmMin:0};
+let CFG=Object.assign({},CFG_DEFAULT,store.get("lv.cfg",{}));
+const CFG_URLS=["./config.json","https://eonmetall-qc.github.io/universal-logo-verify-app/config.json","https://raw.githubusercontent.com/Eonmetall-QC/universal-logo-verify-app/main/config.json","https://raw.githubusercontent.com/Eonmetall-QC/universal-logo-verify-app/master/config.json"];
+async function loadCfg(){for(const u of CFG_URLS){try{const c=new AbortController();const to=setTimeout(()=>c.abort(),2500);const r=await fetch(u,{cache:"no-store",signal:c.signal});clearTimeout(to);if(!r.ok)continue;const j=await r.json();if(j&&typeof j==="object"){CFG=Object.assign({},CFG_DEFAULT,j);store.set("lv.cfg",CFG);return true;}}catch(e){}}return false;}
+loadCfg();
+function judgeMarkSize(r){const d=r.dbg||{};const mode=(CFG&&CFG.tmMode)||"flag";
+  if(!r.present||!d.size)return {status:"na",ratio:null,match:null,mode};
+  const ratio=d.size,max=+((CFG&&CFG.tmMax))||0,min=+((CFG&&CFG.tmMin))||0;
+  if(mode==="off")return {status:"off",ratio,h:d.sizeH,w:d.sizeW,max,min,mode,match:100};
+  const over=max>0&&ratio>max,under=min>0&&ratio<min;
+  const status=(over||under)?"flag":"ok";
+  return {status,ratio,h:d.sizeH,w:d.sizeW,max,min,mode,match:status==="ok"?100:55};}
+function sizeWords(z){const pct=Math.round(Math.abs(z.ratio-1)*100);return z.ratio>=1?`${pct}% bigger than master`:`${pct}% smaller than master`;}
 // Small marks (™): read the aligned photo directly (no clean-up filter, which erases thin strokes).
 // Score = how well the photo's brightness pattern follows the master's ™ shape, and how strong its contrast is
 // compared with the rest of the logo. Glare is a broad blob, so it does not correlate with the ™ shape.
@@ -778,7 +797,24 @@ function markCheck(Pw,pv,W,H,R,g,inkKind){
   if(!cands.length&&best.T)cands.push(best);
   let pick=null;for(const c of cands){contrast(c);if(!pick||c.sc>pick.sc||(c.sc===pick.sc&&c.corr>pick.corr))pick=c;}
   if(!pick)return {score:0,corr:best.corr,ratio:0,snr:0,s:0,ox:0,oy:0};
-  return {score:100*pick.sc,corr:pick.corr,ratio:pick.ratio,snr:pick.snr,s:pick.s,ox:pick.ox,oy:pick.oy};
+  const sz=measureMarkSize(pick);
+  return {score:100*pick.sc,corr:pick.corr,ratio:pick.ratio,snr:pick.snr,s:pick.s,ox:pick.ox,oy:pick.oy,sizeH:sz.h,sizeW:sz.w,size:Math.sqrt(sz.h*sz.w)};
+  // ™ size vs master: fine search of height and width scale around the size that was found
+  function measureMarkSize(c){
+    const corrAt=(sx,sy,ox0,oy0,rad)=>{const tw=Math.max(4,Math.round(tw0*sx)),th=Math.max(3,Math.round(th0*sy));
+      const T=new Float32Array(tw*th);for(let y=0;y<th;y++)for(let x=0;x<tw;x++)T[y*tw+x]=T0[Math.min(th0-1,(y/sy)|0)*tw0+Math.min(tw0-1,(x/sx)|0)];
+      const Tb=blur3(T,tw,th,1);let st=0,stt=0;for(let i=0;i<Tb.length;i++){st+=Tb[i];stt+=Tb[i]*Tb[i];}const n=tw*th,tvar=stt-st*st/n;if(tvar<1e-6)return {c:-2};
+      const Qm=qFor(th);let lb={c:-2,ox:ox0,oy:oy0};
+      for(let oy=oy0-rad;oy<=oy0+rad;oy++)for(let ox=ox0-rad;ox<=ox0+rad;ox++){const u0=Math.round(cxm+ox-tw/2)+MX,v0=Math.round(cym+oy-th/2)+MY;if(u0<0||v0<0||u0+tw>PW||v0+th>PH)continue;
+        let sv=0,svv=0,svt=0,bad=false;for(let y=0;y<th&&!bad;y++){const row=(v0+y)*PW+u0;for(let x=0;x<tw;x++){const v=Qm[row+x];if(v<-9000){bad=true;break;}const t=Tb[y*tw+x];sv+=v;svv+=v*v;svt+=v*t;}}
+        if(bad)continue;const vv=svv-sv*sv/n;if(vv<1e-6)continue;const cc=(svt-sv*st/n)/Math.sqrt(vv*tvar);if(cc>lb.c)lb={c:cc,ox,oy};}
+      return lb;};
+    let sy=c.th/th0,sx=c.tw/tw0,ox=c.ox,oy=c.oy;const rad=Math.max(2,Math.round(c.th*.15));
+    let bestS={c:-2};for(let f=0.84;f<=1.165;f+=0.02){const r=corrAt(sx*f,sy*f,ox,oy,rad);if(r.c>bestS.c)bestS=Object.assign(r,{f});}
+    if(bestS.c>-2){sx*=bestS.f;sy*=bestS.f;ox=bestS.ox;oy=bestS.oy;}
+    let bestA={c:-2};for(let a=0.88;a<=1.125;a+=0.04){const r=corrAt(sx*a,sy,ox,oy,2);if(r.c>bestA.c)bestA=Object.assign(r,{a});}
+    if(bestA.c>-2)sx*=bestA.a;
+    return {h:sy,w:sx};}
 }
 
 
@@ -886,6 +922,13 @@ function animateReadout(score){
   if(RM){num.textContent=score.toFixed(1);return;}
   const t0=performance.now(),D=1200;const step=n=>{const p=Math.min(1,(n-t0)/D),e=1-Math.pow(1-p,3);num.textContent=(score*e).toFixed(1);if(p<1)requestAnimationFrame(step);};requestAnimationFrame(step);
 }
+function sizeRow(r){const z=r.size;if(!z)return "";
+  if(z.status==="na")return `<li><span>Mark size</span><div></div><span class="num">–</span><span class="tag">Not measured</span></li>`;
+  const flag=z.status==="flag",off=z.status==="off";
+  const sub=off?" · measure only":(z.max?` · flag over ${z.max}×`:" · measure only");
+  const tag=off?"Measured":flag?"Check":"OK";const cls=off?"":flag?"v-warn":"v-pass";
+  const col=off?"var(--muted)":flag?gcol("warn"):gcol("pass");const w=flag?55:100;
+  return `<li data-size="h${z.h.toFixed(3)} w${z.w.toFixed(3)}"><span>Mark size<br><small class="muted">master = 1.00×${sub}</small></span><div class="bar-t"><b style="width:${w}%;background:${col}"></b></div><span class="num">${z.ratio.toFixed(2)}×</span><span class="tag ${cls}">${tag}</span></li>`;}
 function showResult(res){
   lastRes=res;window.__lvLast=res;const s=res.overall.score;let g=grade(s);const acc=+$("tAcc").value||90;
   const lostMark=res.regions.find(r=>r.presence&&r.score<50);
@@ -894,10 +937,12 @@ function showResult(res){
   if(loc&&loc.score<rej-10){g={k:"fail",word:"Reject",why:`One part of the logo is clearly wrong or missing (${where}, ${loc.score.toFixed(0)}% match there).`};}
   else if(loc&&loc.score<rej&&g.k==="pass"){g={k:"warn",word:"Accept with concern",why:`Overall the logo matches, but one part differs (${where}, ${loc.score.toFixed(0)}% match there). Check it by eye.`};}
   else if(lostMark&&g.k==="pass")g={k:"warn",word:"Accept with concern",why:"The logo shape matches, but the small mark (™ / ®) is missing or unreadable. Look at it by eye; if glare hides it, retake the photo."};
+  const szFlag=res.regions.find(r=>r.presence&&r.size&&r.size.status==="flag");
+  if(szFlag&&g.k==="pass"){const z=szFlag.size;g={k:"warn",word:"Accept with concern",why:`The logo shape matches, but the small mark (™ / ®) size is unusual: printed ${z.ratio.toFixed(2)}× the master (${sizeWords(z)}). Please check it by eye.`};}
   const rows=res.regions.map(r=>{let k,label;if(r.presence){k=r.score>=80?"pass":r.score>=50?"warn":"fail";label=k==="pass"?"OK":k==="warn"?"Faint":"Missing";}
     else{k=grade(r.score).k;label=k==="pass"?"OK":k==="warn"?"Check":"Wrong";}
-    return `<li><span>${esc(r.name)}</span><div class="bar-t"><b style="width:${r.score.toFixed(1)}%;background:${gcol(k)}"></b></div><span class="num">${r.score.toFixed(0)}%</span><span class="tag v-${k}">${label}</span></li>`;}).join("");
-  const issues=[];res.regions.forEach(r=>{if(r.presence){if(r.score<50)issues.push(`<li><b>${esc(r.name)}</b>: not found. Check it is printed; glare can also hide it, so retake if unsure.</li>`);else if(r.score<80)issues.push(`<li><b>${esc(r.name)}</b>: printed but faint or blurred.</li>`);return;}
+    return `<li><span>${esc(r.name)}</span><div class="bar-t"><b style="width:${r.score.toFixed(1)}%;background:${gcol(k)}"></b></div><span class="num">${r.score.toFixed(0)}%</span><span class="tag v-${k}">${label}</span></li>`+(r.presence?sizeRow(r):"");}).join("");
+  const issues=[];res.regions.forEach(r=>{if(r.presence){if(r.score<50)issues.push(`<li><b>${esc(r.name)}</b>: not found. Check it is printed; glare can also hide it, so retake if unsure.</li>`);else if(r.score<80)issues.push(`<li><b>${esc(r.name)}</b>: printed but faint or blurred.</li>`);if(r.size&&(r.size.status==="flag"))issues.push(`<li><b>Mark size</b>: printed ${r.size.ratio.toFixed(2)}× the master (${sizeWords(r.size)}; height ${r.size.h.toFixed(2)}×, width ${r.size.w.toFixed(2)}×).</li>`);return;}
     if(r.score>=acc)return;const parts=[];if(r.missPct>=3)parts.push(`${r.missPct.toFixed(0)}% of the ink is missing or faded`);if(r.extraPct>=3)parts.push(`extra ink, smudge or glare equal to ${r.extraPct.toFixed(0)}% of the area`);if(!parts.length)parts.push("shape or spacing differs slightly");
     issues.push(`<li><b>${esc(r.name)}</b>: ${parts.join("; ")}.</li>`);});
   const lowFit=res.fit<0.8?`<p class="hint">Alignment confidence is low. Retake the photo straight-on, without glare, and box only the logo before deciding.</p>`:"";
@@ -918,7 +963,7 @@ function showResult(res){
   $("result").querySelectorAll(".toggle button").forEach(b=>b.onclick=()=>{mode=b.dataset.m;$("result").querySelectorAll(".toggle button").forEach(o=>o.setAttribute("aria-pressed",o===b));renderDiff(lastRes,$("diffCanvas"));});
   const weakest=res.regions.filter(r=>!r.presence).slice().sort((a,b)=>a.score-b.score)[0];
   const model=$("model").value.trim(),desc=$("desc").value.trim();rememberModel(model,desc);
-  const log=store.get(K.log,[]);log.unshift({t:new Date().toISOString(),model,desc,score:+s.toFixed(1),result:g.word,weak:(loc&&loc.score<rej?`Part ${where} ${loc.score.toFixed(0)}%`:`${weakest.name} ${weakest.score.toFixed(0)}%`)+(lostMark?"; small mark missing":""),master:master.name});
+  const log=store.get(K.log,[]);log.unshift({t:new Date().toISOString(),model,desc,score:+s.toFixed(1),result:g.word,weak:(loc&&loc.score<rej?`Part ${where} ${loc.score.toFixed(0)}%`:`${weakest.name} ${weakest.score.toFixed(0)}%`)+(lostMark?"; small mark missing":"")+(res.regions.filter(r=>r.presence&&r.size&&(r.size.status==="flag")).map(r=>`; mark size ${r.size.ratio.toFixed(2)}×`).join("")),master:master.name});
   store.set(K.log,log.slice(0,500));renderLog();
   lastReport=buildReport(res,g,log[0]);$("pdfBtn").onclick=()=>downloadPdf(lastReport);$("printBtn").onclick=()=>printReport(lastReport);
   if(window.matchMedia("(max-width:999px)").matches)$("resultSec").scrollIntoView({behavior:RM?"auto":"smooth"});
@@ -944,6 +989,7 @@ async function runCheck(){
   $("result").classList.add("pending");scan.className="scan on";const k=RM?0:0.35;
   const step=async(i,ms)=>{steps.forEach((li,j)=>li.className=j<i?"ok":j===i?"act":"");bar.style.width=(100*(i+.5)/steps.length)+"%";await sleep(ms*k);};
   await step(0,550);await step(1,250);await paint();
+  await loadCfg().catch(()=>{});
   let res=null,err=null;try{res=analyseBest();}catch(e){err=e;}
   const locked=res?placeLock(res):false;await step(2,600);if(locked)lockEl.classList.add("cmp");await step(3,750);await step(4,400);
   steps.forEach(li=>li.className="ok");bar.style.width="100%";scan.classList.add("done");await sleep(360*k);
@@ -976,7 +1022,10 @@ function buildReport(res,g,entry){
   const keep=mode;mode="diff";const dc=document.createElement("canvas");renderDiff(res,dc);mode=keep;
   const acc=+$("tAcc").value||90,rej=+$("tRej").value||80;
   return {id,date:d.toLocaleString(),model:entry.model||"–",desc:entry.desc||"–",masterName:master.name,score:res.overall.score,verdict:g.word,why:g.why,k:g.k,
-    regions:res.regions.map(r=>({name:r.name,score:r.score,status:r.presence?(r.score>=80?"OK":r.score>=50?"Faint":"Missing"):(r.score>=acc?"OK":r.score>=rej?"Check":"Wrong")})),
+    regions:res.regions.flatMap(r=>{const row={name:r.name,score:r.score,status:r.presence?(r.score>=80?"OK":r.score>=50?"Faint":"Missing"):(r.score>=acc?"OK":r.score>=rej?"Check":"Wrong")};
+      if(!r.presence||!r.size)return [row];const z=r.size;
+      return [row,{name:"Mark size (master = 1.00×)",score:0,txt:z.ratio==null?"–":`${z.ratio.toFixed(2)}×`,status:z.status==="na"?"Not measured":z.status==="off"?"Not graded":z.status==="flag"?"Check":"OK"}];}),
+    tmTol:0,
     photo:pc.toDataURL("image/jpeg",.88),photoAR:ph/pw,diff:dc.toDataURL("image/png"),diffAR:dc.height/dc.width,master:master.img,acc,rej,tol:$("tol").selectedOptions[0].textContent,hasMark:res.regions.some(r=>r.presence)};
 }
 function imgAR(url){return new Promise(res=>{const i=new Image();i.onload=()=>res(i.naturalHeight/i.naturalWidth);i.onerror=()=>res(.2);i.src=url;});}
@@ -992,8 +1041,8 @@ async function makePdf(r){
   doc.setTextColor(...col);doc.setFont("helvetica","bold");doc.setFontSize(24);doc.text(`${r.score.toFixed(1)}%`,L+6,y+13);
   doc.setFontSize(16);doc.text(r.verdict,L+52,y+9);doc.setFont("helvetica","normal");doc.setFontSize(9.5);doc.setTextColor(0);doc.text(doc.splitTextToSize(r.why,122),L+52,y+15);
   y+=27;doc.setFont("helvetica","bold");doc.setFontSize(11);doc.text("Match by area",L,y);y+=5;doc.setFontSize(10);doc.setDrawColor(170);doc.setLineWidth(.2);
-  r.regions.forEach(g=>{doc.setFont("helvetica","normal");doc.text(g.name.replace("™","TM").replace("®","(R)"),L+2,y);doc.text(`${g.score.toFixed(1)}%`,L+110,y,{align:"right"});
-    const c={OK:[21,152,95],Check:[185,118,6],Faint:[185,118,6],Wrong:[217,51,73],Missing:[217,51,73]}[g.status];doc.setTextColor(...c);doc.setFont("helvetica","bold");doc.text(g.status,L+120,y);doc.setTextColor(0);y+=2.5;doc.line(L,y,L+Wd,y);y+=5;});
+  r.regions.forEach(g=>{doc.setFont("helvetica","normal");doc.text(g.name.replace("™","TM").replace("®","(R)"),L+2,y);doc.text(g.txt||`${g.score.toFixed(1)}%`,L+110,y,{align:"right"});
+    const c={OK:[21,152,95],Check:[185,118,6],Faint:[185,118,6],Wrong:[217,51,73],Missing:[217,51,73]}[g.status]||[90,90,90];doc.setTextColor(...c);doc.setFont("helvetica","bold");doc.text(g.status,L+120,y);doc.setTextColor(0);y+=2.5;doc.line(L,y,L+Wd,y);y+=5;});
   if(y>200){doc.addPage();y=20;}
   y+=2;doc.setFont("helvetica","bold");doc.setFontSize(11);doc.text("Inspected logo (photo)",L,y);doc.text("Master logo",L+95,y);y+=2.5;
   const mAR=await imgAR(r.master);const ih=Math.min(40,85*r.photoAR);doc.addImage(r.photo,"JPEG",L,y,ih/r.photoAR,ih);
@@ -1003,7 +1052,7 @@ async function makePdf(r){
   doc.setFontSize(8.5);doc.setFont("helvetica","normal");
   [[255,78,96,"Missing compared with master"],[255,190,80,"Extra ink, smudge or glare"],[226,232,243,"Matches master"]].forEach((c,i)=>{const x=L+i*60;doc.setFillColor(c[0],c[1],c[2]);doc.setDrawColor(150);doc.rect(x,y-2.6,3,3,"FD");doc.text(c[3],x+5,y);});
   y+=7;doc.setTextColor(90);
-  doc.text(doc.splitTextToSize(`Method: the photo is aligned to the master logo and compared shape by shape (edge tolerance: ${r.tol}). Grading: accept at ${r.acc}% or above, accept with concern ${r.rej}-${r.acc}%, reject below ${r.rej}%.${r.hasMark?" Small marks (TM / R) are checked for presence and count 10% of the overall score.":""} Colour shade is not measured.`,Wd),L,y);
+  doc.text(doc.splitTextToSize(`Method: the photo is aligned to the master logo and compared shape by shape (edge tolerance: ${r.tol}). Grading: accept at ${r.acc}% or above, accept with concern ${r.rej}-${r.acc}%, reject below ${r.rej}%.${r.hasMark?" Small marks (TM / R) are checked for presence and count 10% of the overall score."+(r.tmTol?` Their size is compared with the master: allowed ±${r.tmTol}%, check up to ±${2*r.tmTol}%, reject beyond.`:" Their size is measured but not graded."):""} Colour shade is not measured.`,Wd),L,y);
   doc.setFontSize(8);doc.setTextColor(120);doc.text(`Logo Verify  |  ${r.id}`,L,290);return doc.output("blob");
 }
 async function downloadPdf(r){const note=$("repNote");note.textContent="Preparing PDF…";
@@ -1015,10 +1064,10 @@ function printReport(r){
   const col=r.k==="pass"?"#15985f":r.k==="warn"?"#b97606":"#d93349";
   $("printReport").innerHTML=`<h1>Logo Inspection Report</h1><div>Report no. ${esc(r.id)}</div><table>${rows}</table>
     <div class="res" style="color:${col};border-color:${col}">${r.score.toFixed(1)}% &nbsp; ${esc(r.verdict)}<div style="font-size:10pt;font-weight:400;color:#000">${esc(r.why)}</div></div>
-    <table><tr><th>Area</th><th>Match</th><th>Status</th></tr>${r.regions.map(g=>`<tr><td>${esc(g.name)}</td><td>${g.score.toFixed(1)}%</td><td>${g.status}</td></tr>`).join("")}</table>
+    <table><tr><th>Area</th><th>Match</th><th>Status</th></tr>${r.regions.map(g=>`<tr><td>${esc(g.name)}</td><td>${g.txt||g.score.toFixed(1)+"%"}</td><td>${g.status}</td></tr>`).join("")}</table>
     <div class="imgs"><div><b>Inspected logo (photo)</b><br><img src="${r.photo}"></div><div><b>Master logo</b><br><img src="${r.master}"></div></div>
     <p><b>Difference map</b> (red = missing, orange = extra ink, smudge or glare)<br><img src="${r.diff}" style="width:100%"></p>
-    <p style="font-size:9pt;color:#555">Grading: accept at ${r.acc}% or above, accept with concern ${r.rej}–${r.acc}%, reject below ${r.rej}%. Edge tolerance: ${esc(r.tol)}.</p>`;
+    <p style="font-size:9pt;color:#555">Grading: accept at ${r.acc}% or above, accept with concern ${r.rej}–${r.acc}%, reject below ${r.rej}%. ${r.hasMark?(r.tmTol?`Small mark size allowed ±${r.tmTol}% of master. `:"Small mark size not graded. "):""}Edge tolerance: ${esc(r.tol)}.</p>`;
   try{window.print();}catch(e){}$("repNote").textContent="If no print window opened, download the PDF and print it.";}
 
 /* ---------- owner ---------- */
@@ -1032,8 +1081,8 @@ function sha256(s){const K=[],H=[];let p=2,n=0;const isP=x=>{for(let f=2;f*f<=x;
     for(let i=0;i<8;i++)H[i]=(H[i]+a[i])|0;}
   return H.map(h=>(h>>>0).toString(16).padStart(8,"0")).join("");}
 
-let owner=Object.assign({acc:90,rej:80,tol:"1",pin:null},store.get(K.owner,{}));
-function applyOwner(){$("tAcc").value=owner.acc;$("tRej").value=owner.rej;$("tol").value=owner.tol;}applyOwner();
+let owner=Object.assign({acc:90,rej:80,tol:"1",tmTol:"0",pin:"17743d8b7ecab90fd6eea19227efd8fb631673f3615d54a75db750c4018bc75b"},store.get(K.owner,{}));
+function applyOwner(){$("tAcc").value=owner.acc;$("tRej").value=owner.rej;$("tol").value=owner.tol;$("tmTol").value=owner.tmTol;}applyOwner();
 const dlg=$("ownerDlg");let fails=0,lockedUntil=0,cropSrc=null,cropRect=null,cropScale=1;
 function showView(id){for(const v of ["pinView","newPinView","ownerView","cropView"])$(v).hidden=v!==id;const f=$(id).querySelector("input:not([type=file])");if(f&&id!=="ownerView")setTimeout(()=>f.focus(),50);}
 function openDlg(){if(!dlg.open){try{dlg.showModal();}catch(e){dlg.setAttribute("open","");}}}
@@ -1041,7 +1090,7 @@ function openOwner(){$("pinIn").value="";$("pinErr").textContent="";
   if(!owner.pin){$("newPinTitle").textContent="Create the owner PIN";$("newPinWhy").textContent="The owner PIN protects the master logo and grading on this device. Use 4 to 12 digits.";$("npErr").textContent="";showView("newPinView");}
   else showView("pinView");openDlg();}
 function closeOwner(){$("pinIn").value=$("np1").value=$("np2").value="";try{dlg.close();}catch(e){dlg.removeAttribute("open");}}
-function fillOwner(){$("oAcc").value=owner.acc;$("oRej").value=owner.rej;$("oTol").value=owner.tol;$("mName").value=master?master.name:"";$("ownErr").textContent="";
+function fillOwner(){$("oAcc").value=owner.acc;$("oRej").value=owner.rej;$("oTol").value=owner.tol;$("oTmTol").value=owner.tmTol;$("mName").value=master?master.name:"";$("ownErr").textContent="";
   const n=Object.keys(models()).length;$("modelCount").textContent=`${n} saved model${n===1?"":"s"} and ${store.get(K.log,[]).length} log entries on this device.`;showView("ownerView");}
 $("pinView").addEventListener("submit",e=>{e.preventDefault();const now=Date.now();
   if(now<lockedUntil){$("pinErr").textContent=`Too many wrong PINs. Try again in ${Math.ceil((lockedUntil-now)/1000)} s.`;return;}
@@ -1058,7 +1107,7 @@ $("ownClose").onclick=closeOwner;
 $("ownSave").onclick=()=>{const a=parseFloat($("oAcc").value),r=parseFloat($("oRej").value);$("ownErr").className="err";
   if(!(a>0&&a<=100)||!(r>=0&&r<=100)){$("ownErr").textContent="Enter levels between 0 and 100.";return;}
   if(r>=a){$("ownErr").textContent="The reject level must be lower than the accept level.";return;}
-  owner.acc=a;owner.rej=r;owner.tol=$("oTol").value;store.set(K.owner,owner);applyOwner();
+  owner.acc=a;owner.rej=r;owner.tol=$("oTol").value;owner.tmTol=$("oTmTol").value;store.set(K.owner,owner);applyOwner();
   const nm=$("mName").value.trim();if(master&&nm&&nm!==master.name){master.name=nm;const rec=store.get(K.master,null);if(rec){rec.name=nm;store.set(K.master,rec);}updateMasterUI();}
   closeOwner();};
 $("forgetModels").onclick=()=>{if(confirm("Forget all saved models and descriptions on this device?")){store.set(K.models,{});fillModelList();onModel();fillOwner();$("ownErr").className="ok-msg";$("ownErr").textContent="Saved models cleared.";}};
