@@ -735,7 +735,7 @@ function analyse(rot,opt){rot=rot||0;opt=opt||{};
 const CFG_DEFAULT={tmMode:"flag",tmMax:2.5,tmMin:0};
 let CFG=Object.assign({},CFG_DEFAULT,store.get("lv.cfg",{}));
 const CFG_URLS=["./config.json","https://eonmetall-qc.github.io/universal-logo-verify-app/config.json","https://raw.githubusercontent.com/Eonmetall-QC/universal-logo-verify-app/main/config.json","https://raw.githubusercontent.com/Eonmetall-QC/universal-logo-verify-app/master/config.json"];
-async function loadCfg(){for(const u of CFG_URLS){try{const c=new AbortController();const to=setTimeout(()=>c.abort(),2500);const r=await fetch(u,{cache:"no-store",signal:c.signal});clearTimeout(to);if(!r.ok)continue;const j=await r.json();if(j&&typeof j==="object"){CFG=Object.assign({},CFG_DEFAULT,j);store.set("lv.cfg",CFG);return true;}}catch(e){}}return false;}
+async function loadCfg(){for(const u of CFG_URLS){try{const c=new AbortController();const to=setTimeout(()=>c.abort(),2500);const r=await fetch(u+(u.indexOf("?")<0?"?":"&")+"t="+Date.now(),{cache:"no-store",signal:c.signal});clearTimeout(to);if(!r.ok)continue;const j=await r.json();if(j&&typeof j==="object"){CFG=Object.assign({},CFG_DEFAULT,j);store.set("lv.cfg",CFG);return true;}}catch(e){}}return false;}
 loadCfg();
 function judgeMarkSize(r){const d=r.dbg||{};const mode=(CFG&&CFG.tmMode)||"flag";
   if(!r.present||!d.size)return {status:"na",ratio:null,match:null,mode};
